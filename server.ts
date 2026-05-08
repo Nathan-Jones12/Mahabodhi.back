@@ -5,6 +5,7 @@ import jwt, { SignOptions } from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import { RowDataPacket, ResultSetHeader } from 'mysql2';
 import { pool, pingDb } from './db';
+import { moderate, moderateMany } from './moderation';
 
 dotenv.config();
 
@@ -14,12 +15,31 @@ const JWT_SECRET = process.env.JWT_SECRET ?? 'dev-only-insecure-secret';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN ?? '7d';
 
 const corsOriginEnv = process.env.CORS_ORIGIN ?? '*';
-const corsOrigin =
+const allowList =
   corsOriginEnv === '*'
-    ? '*'
+    ? null
     : corsOriginEnv.split(',').map((s) => s.trim()).filter(Boolean);
 
-app.use(cors({ origin: corsOrigin }));
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (allowList === null) return cb(null, true);
+    if (allowList.includes(origin)) return cb(null, true);
+    if (/^https:\/\/([a-z0-9-]+--)?mahabodhi\.netlify\.app$/.test(origin)) {
+      return cb(null, true);
+    }
+    return cb(new Error(`origin_not_allowed:${origin}`));
+  },
+  credentials: false,
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+app.use((_req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
 app.use(express.json({ limit: '1mb' }));
 
 // ---------- types ----------
@@ -89,6 +109,10 @@ app.post('/api/auth/register', asyncHandler(async (req, res) => {
   }
   if (typeof password !== 'string' || password.length < 6) {
     return res.status(400).json({ error: 'password_too_short' });
+  }
+  const modCheck = await moderateMany({ username, display_name });
+  if (!modCheck.ok) {
+    return res.status(400).json({ error: 'content_blocked', reason: modCheck.reason });
   }
   const hash = await bcrypt.hash(password, 10);
   try {
@@ -311,6 +335,10 @@ app.get('/api/forum/posts/:id', asyncHandler(async (req, res) => {
 app.post('/api/forum/posts', authRequired, asyncHandler(async (req, res) => {
   const { title, body, concept_tag } = req.body ?? {};
   if (!title || !body) return res.status(400).json({ error: 'title_and_body_required' });
+  const modCheck = await moderateMany({ title, body, concept_tag });
+  if (!modCheck.ok) {
+    return res.status(400).json({ error: 'content_blocked', reason: modCheck.reason });
+  }
   const [result] = await pool.execute<ResultSetHeader>(
     'INSERT INTO forum_posts (user_id, title, body, concept_tag) VALUES (?, ?, ?, ?)',
     [req.userId!,title, body, concept_tag ?? null]
@@ -321,6 +349,10 @@ app.post('/api/forum/posts', authRequired, asyncHandler(async (req, res) => {
 app.patch('/api/forum/posts/:id', authRequired, asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   const { title, body, concept_tag } = req.body ?? {};
+  const modCheck = await moderateMany({ title, body, concept_tag });
+  if (!modCheck.ok) {
+    return res.status(400).json({ error: 'content_blocked', reason: modCheck.reason });
+  }
   const [result] = await pool.execute<ResultSetHeader>(
     'UPDATE forum_posts SET title = COALESCE(?, title), body = COALESCE(?, body), concept_tag = COALESCE(?, concept_tag) WHERE id = ? AND user_id = ?',
     [title ?? null, body ?? null, concept_tag ?? null, id, req.userId!]
@@ -343,6 +375,10 @@ app.post('/api/forum/posts/:id/replies', authRequired, asyncHandler(async (req, 
   const id = Number(req.params.id);
   const { body } = req.body ?? {};
   if (!body) return res.status(400).json({ error: 'body_required' });
+  const modCheck = await moderate(body);
+  if (!modCheck.ok) {
+    return res.status(400).json({ error: 'content_blocked', reason: modCheck.reason });
+  }
   const [result] = await pool.execute<ResultSetHeader>(
     'INSERT INTO forum_replies (post_id, user_id, body) VALUES (?, ?, ?)',
     [id, req.userId!,body]
